@@ -7,6 +7,7 @@
 #include "threads/interrupt.h"
 #include "threads/synch.h"
 #include "threads/thread.h"
+#include "threads/malloc.h"
   
 /* See [8254] for hardware details of the 8254 timer chip. */
 
@@ -17,12 +18,22 @@
 #error TIMER_FREQ <= 1000 recommended
 #endif
 
+struct thread_sleep
+  {
+    struct list_elem elem;
+    int64_t start;
+    int64_t duration;
+    struct semaphore semaphore;
+  };
+
 /* Number of timer ticks since OS booted. */
 static int64_t ticks;
 
 /* Number of loops per timer tick.
    Initialized by timer_calibrate(). */
 static unsigned loops_per_tick;
+
+static struct list thread_sleep_list;
 
 static intr_handler_func timer_interrupt;
 static bool too_many_loops (unsigned loops);
@@ -37,6 +48,7 @@ timer_init (void)
 {
   pit_configure_channel (0, 2, TIMER_FREQ);
   intr_register_ext (0x20, timer_interrupt, "8254 Timer");
+  list_init(&thread_sleep_list);
 }
 
 /* Calibrates loops_per_tick, used to implement brief delays. */
@@ -89,11 +101,17 @@ timer_elapsed (int64_t then)
 void
 timer_sleep (int64_t ticks) 
 {
-  int64_t start = timer_ticks ();
+  struct thread_sleep* sleeper = malloc (sizeof (struct thread_sleep));
+  sleeper->start = timer_ticks ();
+  sleeper->duration = ticks;
+  list_push_back (&thread_sleep_list, &sleeper->elem);
 
   ASSERT (intr_get_level () == INTR_ON);
-  while (timer_elapsed (start) < ticks) 
-    thread_yield ();
+
+  sema_init (&sleeper->semaphore, 0);
+  sema_down (&sleeper->semaphore);
+
+  free(sleeper);
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -165,13 +183,30 @@ timer_print_stats (void)
 {
   printf ("Timer: %"PRId64" ticks\n", timer_ticks ());
 }
-
+
 /* Timer interrupt handler. */
 static void
 timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
   thread_tick ();
+
+  struct list_elem* cursor = list_begin (&thread_sleep_list);
+
+  while (cursor != list_end(&thread_sleep_list))
+    {
+      struct thread_sleep* sleeper = list_entry(cursor, struct thread_sleep, elem);
+
+      if (timer_elapsed (sleeper->start) < sleeper->duration)
+        {
+          cursor = list_next (cursor);
+        }
+      else
+        {
+          sema_up (&sleeper->semaphore);
+          cursor = list_remove (cursor);
+        }
+    }
 }
 
 /* Returns true if LOOPS iterations waits for more than one timer
